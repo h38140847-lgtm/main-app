@@ -1402,11 +1402,16 @@ def assign_delivery_boy(order_doc_id):
 def get_owner_upi():
     for doc in db.collection("owners").stream():
         d = doc.to_dict()
+        mobile = str(doc.id or "").strip()
+        configured_upi = (d.get("upiId") or "").strip()
+        fallback_upi = f"{mobile}@ibl" if mobile else ""
         return jsonify({
-            "upiId": d.get("upiId", ""),
+            "upiId": configured_upi,
+            "fallbackUpiId": fallback_upi,
+            "mobile": mobile,
             "name":  d.get("shopName") or d.get("name", "Owner"),
         })
-    return jsonify({"upiId": "", "name": "Owner"})
+    return jsonify({"upiId": "", "fallbackUpiId": "", "mobile": "", "name": "Owner"})
 
 
 @app.route("/owner/upi", methods=["PUT"])
