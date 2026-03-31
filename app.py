@@ -129,21 +129,23 @@ def _compute_delivery_charge(lat, lng, free_km, charge_amt):
 @app.route("/owner/settings", methods=["PUT"])
 def update_store_settings():
     data = request.json or {}
+    existing_doc = db.collection("store_settings").document("main").get()
+    existing = existing_doc.to_dict() if existing_doc.exists else {}
     results = {}
     try:
-        min_amt = float(data.get("minOrderAmount", 0))
+        min_amt = float(data.get("minOrderAmount", existing.get("minOrderAmount", 0)))
         if min_amt < 0: raise ValueError()
         results["minOrderAmount"] = min_amt
     except (TypeError, ValueError):
         return jsonify({"status": "error", "message": "minOrderAmount must be a non-negative number"}), 400
     try:
-        free_km = float(data.get("freeDeliveryKm", 0))
+        free_km = float(data.get("freeDeliveryKm", existing.get("freeDeliveryKm", 0)))
         if free_km < 0: raise ValueError()
         results["freeDeliveryKm"] = free_km
     except (TypeError, ValueError):
         return jsonify({"status": "error", "message": "freeDeliveryKm must be a non-negative number"}), 400
     try:
-        charge = float(data.get("deliveryCharge", 0))
+        charge = float(data.get("deliveryCharge", existing.get("deliveryCharge", 0)))
         if charge < 0: raise ValueError()
         results["deliveryCharge"] = charge
     except (TypeError, ValueError):
