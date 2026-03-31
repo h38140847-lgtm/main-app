@@ -966,8 +966,6 @@ def edit_order_items(order_doc_id):
 def update_owner_profile():
     data = request.json or {}
 
-    print("DEBUG DATA:", data)  # 👈 ADD THIS
-
     mobile = (data.get("mobile") or "").strip()
     if not mobile:
         return jsonify({"status": "error", "message": "mobile required"}), 400
@@ -979,6 +977,13 @@ def update_owner_profile():
     update_data = {}
 
     try:
+        name = (data.get("name") or "").strip()
+        shop_name = (data.get("shopName") or "").strip()
+        if name:
+            update_data["name"] = name
+        if shop_name:
+            update_data["shopName"] = shop_name
+
         if data.get("latitude") not in (None, ""):
             update_data["latitude"] = float(data.get("latitude"))
 
@@ -988,6 +993,10 @@ def update_owner_profile():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
 
+    if not update_data:
+        return jsonify({"status": "error", "message": "No valid fields to update"}), 400
+
+    update_data["updatedAt"] = datetime.now(UTC)
     owner_ref.update(update_data)
 
     return jsonify({"status": "success"})
