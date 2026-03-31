@@ -668,6 +668,27 @@ def update_order_status(order_doc_id):
     ref.update({"status": new_status, "updatedAt": datetime.now(UTC)})
     return jsonify({"status": "success", "message": f"Order status updated to '{new_status}'"})
 
+
+@app.route("/owner/order/<order_doc_id>", methods=["DELETE"])
+def delete_order_by_owner(order_doc_id):
+    active_ref = db.collection("orders").document(order_doc_id)
+    active_doc = active_ref.get()
+    if active_doc.exists:
+        order_data = active_doc.to_dict() or {}
+        old_status = order_data.get("status", "")
+        if old_status in {"Pending", "Assigned", "Processing", "Out for Delivery"}:
+            _restore_stock_for_order(order_data)
+        active_ref.delete()
+        return jsonify({"status": "success", "message": "Order deleted from active orders"})
+
+    archived_ref = db.collection("delivered_orders").document(order_doc_id)
+    archived_doc = archived_ref.get()
+    if archived_doc.exists:
+        archived_ref.delete()
+        return jsonify({"status": "success", "message": "Order deleted from archived orders"})
+
+    return jsonify({"status": "error", "message": "Order not found"}), 404
+
 # ═════════════════════════════════════════════════════════════════════════════
 # OWNER — USERS
 # ═════════════════════════════════════════════════════════════════════════════
