@@ -169,6 +169,37 @@ def send_push(title: str, body: str, data: dict = None):
     return sent
 
 
+def send_delivery_push(mobile: str, title: str, body: str, data: dict = None) -> int:
+    """Send FCM push to a single delivery boy (all registered tokens)."""
+    if not mobile:
+        return 0
+    ref = db.collection("delivery_boys").document(mobile)
+    doc = ref.get()
+    if not doc.exists:
+        return 0
+    tokens = _collect_tokens(doc.to_dict())
+    if not tokens:
+        return 0
+    sent = 0
+    for token in tokens:
+        try:
+            msg = _build_fcm_message(token=token, title=title, body=body, data=data)
+            messaging.send(msg)
+            sent += 1
+        except Exception as e:
+            err = str(e).lower()
+            logger.warning("[FCM] delivery send failed for token %s...: %s", token[:20], err)
+            if (
+                "registration-token-not-registered" in err
+                or "requested entity was not found" in err
+                or "unregistered" in err
+            ):
+                ref.update({
+                    "fcmTokens": ArrayRemove([token]),
+                    "fcmToken": firestore.DELETE_FIELD,
+                })
+    return sent
+
 def send_customer_push(mobile: str, title: str, body: str, data: dict = None) -> int:
     """Send FCM push to a single customer (all registered tokens)."""
     sent = 0
@@ -1682,6 +1713,60 @@ def delivery_login():
     })
 
 
+# DELIVERY BOY — FCM TOKEN
+@app.route("/delivery/save-fcm-token", methods=["POST"])
+def save_delivery_fcm_token():
+    data = request.json or {}
+    mobile = (data.get("mobile") or "").strip()
+    token = (data.get("fcmToken") or "").strip()
+
+    if not mobile or not token:
+        return jsonify({"status": "error", "message": "mobile and fcmToken required"}), 400
+
+    ref = db.collection("delivery_boys").document(mobile)
+    if not ref.get().exists:
+        return jsonify({"status": "error", "message": "Delivery boy not found"}), 404
+
+    ref.update({
+        "fcmToken": token,
+        "fcmTokens": ArrayUnion([token]),
+        "tokenUpdatedAt": datetime.now(UTC),
+    })
+    logger.info("[FCM] Token saved for delivery %s: %s...", mobile, token[:20])
+    return jsonify({"status": "success", "message": "Token saved"})
+
+
+@app.route("/delivery/clear-fcm-token", methods=["POST"])
+def clear_delivery_fcm_token():
+    data = request.json or {}
+    mobile = (data.get("mobile") or "").strip()
+    token = (data.get("fcmToken") or "").strip()
+    if not mobile:
+        return jsonify({"status": "error", "message": "mobile required"}), 400
+
+    ref = db.collection("delivery_boys").document(mobile)
+    doc = ref.get()
+    if not doc.exists:
+        return jsonify({"status": "error", "message": "Delivery boy not found"}), 404
+
+    update_data = {"tokenUpdatedAt": datetime.now(UTC)}
+    if token:
+        update_data["fcmTokens"] = ArrayRemove([token])
+        if (doc.to_dict() or {}).get("fcmToken") == token:
+            update_data["fcmToken"] = firestore.DELETE_FIELD
+        ref.update(update_data)
+        logger.info("[FCM] Token removed for delivery %s: %s...", mobile, token[:20])
+        return jsonify({"status": "success", "message": "Token removed"})
+
+    ref.update({
+        "fcmToken": firestore.DELETE_FIELD,
+        "fcmTokens": firestore.DELETE_FIELD,
+        "tokenUpdatedAt": datetime.now(UTC),
+    })
+    logger.info("[FCM] All tokens cleared for delivery %s", mobile)
+    return jsonify({"status": "success", "message": "All tokens cleared"})
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DELIVERY BOY — FETCH ASSIGNED ORDERS  (real-time polling)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1761,6 +1846,24 @@ def assign_delivery_boy(order_doc_id):
         update["status"]            = "Pending"
 
     ref.update(update)
+    if delivery_mobile:
+        try:
+            order_data = doc.to_dict() or {}
+            order_id = order_data.get("orderId") or order_doc_id
+            customer_mobile = order_data.get("mobile") or ""
+            send_delivery_push(
+                mobile=delivery_mobile,
+                title=f"New Delivery #{order_id}",
+                body=f"Order assigned. Pickup & deliver to customer {customer_mobile}.",
+                data={
+                    "type": "delivery_assignment",
+                    "orderId": str(order_id),
+                    "docId": order_doc_id,
+                    "deliveryBoyMobile": delivery_mobile,
+                },
+            )
+        except Exception as exc:
+            logger.warning("[FCM] Failed to notify delivery boy %s: %s", delivery_mobile, exc)
     return jsonify({
         "status":  "success",
         "message": f"Order assigned to {delivery_name}" if delivery_mobile else "Delivery boy removed",
