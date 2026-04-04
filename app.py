@@ -36,7 +36,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 import firebase_admin
 from firebase_admin import credentials, firestore, messaging
-from google.cloud.firestore import ArrayUnion
+from google.cloud.firestore import ArrayUnion, ArrayRemove
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 app = Flask(__name__)
@@ -133,24 +133,35 @@ def send_push(title: str, body: str, data: dict = None):
     sent = 0
     invalid_tokens = 0
     for owner_doc in db.collection("owners").stream():
-        token = owner_doc.to_dict().get("fcmToken")
-        if not token:
+        od = owner_doc.to_dict()
+        tokens = []
+        if isinstance(od.get("fcmTokens"), list):
+            tokens.extend([t for t in od.get("fcmTokens") if t])
+        if od.get("fcmToken"):
+            tokens.append(od.get("fcmToken"))
+        tokens = list(dict.fromkeys(tokens))
+        if not tokens:
             continue
-        try:
-            msg = _build_fcm_message(token=token, title=title, body=body, data=data)
-            messaging.send(msg)
-            sent += 1
-        except Exception as e:
-            err = str(e).lower()
-            logger.warning("[FCM] send failed for token %s...: %s", token[:20], err)
-            if (
-                "registration-token-not-registered" in err
-                or "requested entity was not found" in err
-                or "unregistered" in err
-            ):
-                owner_doc.reference.update({"fcmToken": firestore.DELETE_FIELD})
-                invalid_tokens += 1
-    logger.info("[FCM] Sent to %s owner(s), removed %s invalid token(s): %s", sent, invalid_tokens, title)
+
+        for token in tokens:
+            try:
+                msg = _build_fcm_message(token=token, title=title, body=body, data=data)
+                messaging.send(msg)
+                sent += 1
+            except Exception as e:
+                err = str(e).lower()
+                logger.warning("[FCM] send failed for token %s...: %s", token[:20], err)
+                if (
+                    "registration-token-not-registered" in err
+                    or "requested entity was not found" in err
+                    or "unregistered" in err
+                ):
+                    owner_doc.reference.update({
+                        "fcmTokens": ArrayRemove([token]),
+                        "fcmToken": firestore.DELETE_FIELD,
+                    })
+                    invalid_tokens += 1
+    logger.info("[FCM] Sent to %s token(s), removed %s invalid token(s): %s", sent, invalid_tokens, title)
     return sent
 
 
@@ -371,7 +382,11 @@ def save_fcm_token():
     if not ref.get().exists:
         return jsonify({"status": "error", "message": "Owner not found"}), 404
 
-    ref.update({"fcmToken": token, "tokenUpdatedAt": datetime.now(UTC)})
+    ref.update({
+        "fcmToken": token,
+        "fcmTokens": ArrayUnion([token]),
+        "tokenUpdatedAt": datetime.now(UTC),
+    })
     logger.info("[FCM] Token saved for owner %s: %s...", mobile, token[:20])
     return jsonify({"status": "success", "message": "Token saved"})
 
@@ -385,9 +400,54 @@ def clear_fcm_token():
     ref = db.collection("owners").document(mobile)
     if not ref.get().exists:
         return jsonify({"status": "error", "message": "Owner not found"}), 404
-    ref.update({"fcmToken": firestore.DELETE_FIELD, "tokenUpdatedAt": datetime.now(UTC)})
+    ref.update({
+        "fcmToken": firestore.DELETE_FIELD,
+        "fcmTokens": firestore.DELETE_FIELD,
+        "tokenUpdatedAt": datetime.now(UTC),
+    })
     logger.info("[FCM] Token cleared for owner %s", mobile)
     return jsonify({"status": "success", "message": "Token cleared"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OWNER — TEST NOTIFICATION (manual real-time check)
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/owner/test-notification", methods=["POST"])
+def test_notification():
+    data = request.json or {}
+    mobile = (data.get("mobile") or "").strip()
+    title = data.get("title", "Test Notification")
+    body = data.get("body", "Push notifications are working correctly!")
+
+    if mobile:
+        ref = db.collection("owners").document(mobile)
+        doc = ref.get()
+        if not doc.exists:
+            return jsonify({"status": "error", "message": "Owner not found"}), 404
+        token = doc.to_dict().get("fcmToken")
+        if not token:
+            return jsonify({
+                "status": "error",
+                "message": "No FCM token found. Please open the app first to register.",
+            }), 400
+        try:
+            msg = _build_fcm_message(
+                token=token,
+                title=title,
+                body=body,
+                data={
+                    "type": "test_notification",
+                    "title": title,
+                    "body": body,
+                },
+            )
+            messaging.send(msg)
+            return jsonify({"status": "success", "message": "Test notification sent!"})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    sent = send_push(title, body, data={"type": "test_notification"})
+    return jsonify({"status": "success", "sent_to": sent})
 
 
 # ═════════════════════════════════════════════════════════════════════════════
