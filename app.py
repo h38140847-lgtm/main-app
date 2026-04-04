@@ -80,12 +80,27 @@ def normalise_unit(unit_value, unit_type):
         v = float(unit_value)
     except (TypeError, ValueError):
         return unit_value, unit_type
-    ut = (unit_type or "").strip().lower()
+    ut = _normalise_unit_str(unit_type)
     if ut == "kg":
         return v * 1000, "g"
     if ut == "l":
         return v * 1000, "ml"
-    return v, unit_type
+    return v, ut
+
+
+def _normalise_unit_str(unit):
+    u = (unit or "").strip().lower()
+    if u in ("pcs", "pc", "piece", "pieces", "pice", "pices"):
+        return "pcs"
+    if u in ("g", "gram", "grams"):
+        return "g"
+    if u in ("kg", "kgs", "kilogram", "kilograms"):
+        return "kg"
+    if u in ("ml", "milliliter", "milliliters", "millilitre", "millilitres"):
+        return "ml"
+    if u in ("l", "liter", "liters", "litre", "litres"):
+        return "l"
+    return u
 
 
 def _verify_password(stored_value, plain_password):
@@ -169,7 +184,7 @@ def _restore_stock_for_order(order_data: dict):
         if prod_doc.exists:
             prod_data  = prod_doc.to_dict()
             unit_value = float(prod_data.get("unitValue", 0))
-            stock_unit = (prod_data.get("stockUnit") or "").lower()
+            stock_unit = _normalise_unit_str(prod_data.get("stockUnit"))
             cur_stock  = float(prod_data.get("quantity", 0))
 
             total_base = qty * unit_value
@@ -178,10 +193,10 @@ def _restore_stock_for_order(order_data: dict):
                 restore = total_base / 1000
             elif stock_unit == "l":
                 restore = total_base / 1000
-            elif stock_unit in ("g", "ml"):
+            elif stock_unit in ("g", "ml", "pcs"):
                 restore = total_base
             else:
-                restore = qty
+                restore = total_base if stock_unit == _normalise_unit_str(prod_data.get("unitType")) else qty
 
             prod_ref.update({"quantity": cur_stock + restore})
 
@@ -365,7 +380,7 @@ def add_product():
     unit_value  = data.get("unitValue")    # qty per pack  (e.g. 500)
     unit_type   = data.get("unitType")     # unit per pack (e.g. "g")
     quantity    = data.get("quantity")     # stock amount  (e.g. 25)
-    stock_unit  = (data.get("stockUnit") or "").strip()   # stock unit (e.g. "kg") ← NEW
+    stock_unit  = _normalise_unit_str(data.get("stockUnit"))   # stock unit (e.g. "kg") ← NEW
     presets = data.get("presets") or []  
     # Validate required fields
     if not name:
@@ -408,7 +423,7 @@ def update_product(product_id):
     if not ref.get().exists:
         return jsonify({"status": "error", "message": "Product not found"}), 404
 
-    stock_unit = (data.get("stockUnit") or "").strip()
+    stock_unit = _normalise_unit_str(data.get("stockUnit"))
     if not stock_unit:
         return jsonify({"status": "error", "message": "stockUnit is required"}), 400
 
@@ -469,7 +484,7 @@ def restock_product(product_id):
     update_data = {"quantity": qty, "updatedAt": datetime.now(UTC)}
     # Optionally update stockUnit during restock
     if data.get("stockUnit"):
-        update_data["stockUnit"] = (data.get("stockUnit") or "").strip()
+        update_data["stockUnit"] = _normalise_unit_str(data.get("stockUnit"))
 
     ref.update(update_data)
     return jsonify({"status": "success", "message": f"Stock updated to {qty}"})
@@ -812,17 +827,17 @@ def place_order():
             if prod_doc.exists:
                 prod_data  = prod_doc.to_dict()
                 unit_value = float(prod_data.get("unitValue", 0))
-                stock_unit = (prod_data.get("stockUnit") or "").lower()
+                stock_unit = _normalise_unit_str(prod_data.get("stockUnit"))
                 cur_stock  = float(prod_data.get("quantity", 0))
                 total_base = qty * unit_value
                 if stock_unit == "kg":
                     deduct = total_base / 1000
                 elif stock_unit == "l":
                     deduct = total_base / 1000
-                elif stock_unit in ("g", "ml"):
+                elif stock_unit in ("g", "ml", "pcs"):
                     deduct = total_base
                 else:
-                    deduct = qty
+                    deduct = total_base if stock_unit == _normalise_unit_str(prod_data.get("unitType")) else qty
                 prod_ref.update({"quantity": max(0, cur_stock - deduct)})
 
     return jsonify({
