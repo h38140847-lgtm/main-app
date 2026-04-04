@@ -429,18 +429,29 @@ def save_fcm_token():
 def clear_fcm_token():
     data = request.json or {}
     mobile = (data.get("mobile") or "").strip()
+    token = (data.get("fcmToken") or "").strip()
     if not mobile:
         return jsonify({"status": "error", "message": "mobile required"}), 400
     ref = db.collection("owners").document(mobile)
-    if not ref.get().exists:
+    doc = ref.get()
+    if not doc.exists:
         return jsonify({"status": "error", "message": "Owner not found"}), 404
+    update_data = {"tokenUpdatedAt": datetime.now(UTC)}
+    if token:
+        update_data["fcmTokens"] = ArrayRemove([token])
+        if (doc.to_dict() or {}).get("fcmToken") == token:
+            update_data["fcmToken"] = firestore.DELETE_FIELD
+        ref.update(update_data)
+        logger.info("[FCM] Token removed for owner %s: %s...", mobile, token[:20])
+        return jsonify({"status": "success", "message": "Token removed"})
+
     ref.update({
         "fcmToken": firestore.DELETE_FIELD,
         "fcmTokens": firestore.DELETE_FIELD,
         "tokenUpdatedAt": datetime.now(UTC),
     })
-    logger.info("[FCM] Token cleared for owner %s", mobile)
-    return jsonify({"status": "success", "message": "Token cleared"})
+    logger.info("[FCM] All tokens cleared for owner %s", mobile)
+    return jsonify({"status": "success", "message": "All tokens cleared"})
 
 
 # CUSTOMER FCM TOKEN
@@ -470,18 +481,29 @@ def save_customer_fcm_token():
 def clear_customer_fcm_token():
     data = request.json or {}
     mobile = (data.get("mobile") or "").strip()
+    token = (data.get("fcmToken") or "").strip()
     if not mobile:
         return jsonify({"status": "error", "message": "mobile required"}), 400
     ref = db.collection("users").document(mobile)
-    if not ref.get().exists:
+    doc = ref.get()
+    if not doc.exists:
         return jsonify({"status": "error", "message": "Customer not found"}), 404
+    update_data = {"tokenUpdatedAt": datetime.now(UTC)}
+    if token:
+        update_data["fcmTokens"] = ArrayRemove([token])
+        if (doc.to_dict() or {}).get("fcmToken") == token:
+            update_data["fcmToken"] = firestore.DELETE_FIELD
+        ref.update(update_data)
+        logger.info("[FCM] Token removed for customer %s: %s...", mobile, token[:20])
+        return jsonify({"status": "success", "message": "Token removed"})
+
     ref.update({
         "fcmToken": firestore.DELETE_FIELD,
         "fcmTokens": firestore.DELETE_FIELD,
         "tokenUpdatedAt": datetime.now(UTC),
     })
-    logger.info("[FCM] Token cleared for customer %s", mobile)
-    return jsonify({"status": "success", "message": "Token cleared"})
+    logger.info("[FCM] All tokens cleared for customer %s", mobile)
+    return jsonify({"status": "success", "message": "All tokens cleared"})
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OWNER — TEST NOTIFICATION (manual real-time check)
@@ -1354,6 +1376,7 @@ def get_owner_profile(mobile):
         "latitude":  d.get("latitude"),
         "longitude": d.get("longitude"),
         "fcmToken":  d.get("fcmToken"),
+        "fcmTokens": d.get("fcmTokens", []),
         "tokenUpdatedAt": d.get("tokenUpdatedAt").isoformat() if hasattr(d.get("tokenUpdatedAt"), "isoformat") else d.get("tokenUpdatedAt"),
     })
 @app.route("/customer/order/<order_doc_id>/hide", methods=["PUT"])
