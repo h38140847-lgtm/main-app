@@ -128,18 +128,22 @@ def _build_fcm_message(token: str, title: str, body: str, data: dict | None = No
     )
 
 
+def _collect_tokens(doc_dict: dict) -> list[str]:
+    tokens: list[str] = []
+    if isinstance(doc_dict.get("fcmTokens"), list):
+        tokens.extend([t for t in doc_dict.get("fcmTokens") if t])
+    if doc_dict.get("fcmToken"):
+        tokens.append(doc_dict.get("fcmToken"))
+    # De-duplicate while preserving order
+    return list(dict.fromkeys(tokens))
+
+
 def send_push(title: str, body: str, data: dict = None):
     """Send FCM push to ALL owner tokens stored in the owners collection."""
     sent = 0
     invalid_tokens = 0
     for owner_doc in db.collection("owners").stream():
-        od = owner_doc.to_dict()
-        tokens = []
-        if isinstance(od.get("fcmTokens"), list):
-            tokens.extend([t for t in od.get("fcmTokens") if t])
-        if od.get("fcmToken"):
-            tokens.append(od.get("fcmToken"))
-        tokens = list(dict.fromkeys(tokens))
+        tokens = _collect_tokens(owner_doc.to_dict())
         if not tokens:
             continue
 
@@ -162,6 +166,36 @@ def send_push(title: str, body: str, data: dict = None):
                     })
                     invalid_tokens += 1
     logger.info("[FCM] Sent to %s token(s), removed %s invalid token(s): %s", sent, invalid_tokens, title)
+    return sent
+
+
+def send_customer_push(mobile: str, title: str, body: str, data: dict = None) -> int:
+    """Send FCM push to a single customer (all registered tokens)."""
+    sent = 0
+    user_ref = db.collection("users").document(mobile)
+    user_doc = user_ref.get()
+    if not user_doc.exists:
+        return 0
+    tokens = _collect_tokens(user_doc.to_dict())
+    if not tokens:
+        return 0
+    for token in tokens:
+        try:
+            msg = _build_fcm_message(token=token, title=title, body=body, data=data)
+            messaging.send(msg)
+            sent += 1
+        except Exception as e:
+            err = str(e).lower()
+            logger.warning("[FCM] send failed for customer token %s...: %s", token[:20], err)
+            if (
+                "registration-token-not-registered" in err
+                or "requested entity was not found" in err
+                or "unregistered" in err
+            ):
+                user_ref.update({
+                    "fcmTokens": ArrayRemove([token]),
+                    "fcmToken": firestore.DELETE_FIELD,
+                })
     return sent
 
 
@@ -409,6 +443,46 @@ def clear_fcm_token():
     return jsonify({"status": "success", "message": "Token cleared"})
 
 
+# CUSTOMER FCM TOKEN
+@app.route("/customer/save-fcm-token", methods=["POST"])
+def save_customer_fcm_token():
+    data = request.json or {}
+    mobile = (data.get("mobile") or "").strip()
+    token = (data.get("fcmToken") or "").strip()
+
+    if not mobile or not token:
+        return jsonify({"status": "error", "message": "mobile and fcmToken required"}), 400
+
+    ref = db.collection("users").document(mobile)
+    if not ref.get().exists:
+        return jsonify({"status": "error", "message": "Customer not found"}), 404
+
+    ref.update({
+        "fcmToken": token,
+        "fcmTokens": ArrayUnion([token]),
+        "tokenUpdatedAt": datetime.now(UTC),
+    })
+    logger.info("[FCM] Token saved for customer %s: %s...", mobile, token[:20])
+    return jsonify({"status": "success", "message": "Token saved"})
+
+
+@app.route("/customer/clear-fcm-token", methods=["POST"])
+def clear_customer_fcm_token():
+    data = request.json or {}
+    mobile = (data.get("mobile") or "").strip()
+    if not mobile:
+        return jsonify({"status": "error", "message": "mobile required"}), 400
+    ref = db.collection("users").document(mobile)
+    if not ref.get().exists:
+        return jsonify({"status": "error", "message": "Customer not found"}), 404
+    ref.update({
+        "fcmToken": firestore.DELETE_FIELD,
+        "fcmTokens": firestore.DELETE_FIELD,
+        "tokenUpdatedAt": datetime.now(UTC),
+    })
+    logger.info("[FCM] Token cleared for customer %s", mobile)
+    return jsonify({"status": "success", "message": "Token cleared"})
+
 # ─────────────────────────────────────────────────────────────────────────────
 # OWNER — TEST NOTIFICATION (manual real-time check)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -424,27 +498,40 @@ def test_notification():
         doc = ref.get()
         if not doc.exists:
             return jsonify({"status": "error", "message": "Owner not found"}), 404
-        token = doc.to_dict().get("fcmToken")
-        if not token:
+        tokens = _collect_tokens(doc.to_dict())
+        if not tokens:
             return jsonify({
                 "status": "error",
                 "message": "No FCM token found. Please open the app first to register.",
             }), 400
-        try:
-            msg = _build_fcm_message(
-                token=token,
-                title=title,
-                body=body,
-                data={
-                    "type": "test_notification",
-                    "title": title,
-                    "body": body,
-                },
-            )
-            messaging.send(msg)
-            return jsonify({"status": "success", "message": "Test notification sent!"})
-        except Exception as e:
-            return jsonify({"status": "error", "message": str(e)}), 500
+        sent = 0
+        for token in tokens:
+            try:
+                msg = _build_fcm_message(
+                    token=token,
+                    title=title,
+                    body=body,
+                    data={
+                        "type": "test_notification",
+                        "title": title,
+                        "body": body,
+                    },
+                )
+                messaging.send(msg)
+                sent += 1
+            except Exception as e:
+                err = str(e).lower()
+                logger.warning("[FCM] send failed for token %s...: %s", token[:20], err)
+                if (
+                    "registration-token-not-registered" in err
+                    or "requested entity was not found" in err
+                    or "unregistered" in err
+                ):
+                    ref.update({
+                        "fcmTokens": ArrayRemove([token]),
+                        "fcmToken": firestore.DELETE_FIELD,
+                    })
+        return jsonify({"status": "success", "message": "Test notification sent!", "sent_to": sent})
 
     sent = send_push(title, body, data={"type": "test_notification"})
     return jsonify({"status": "success", "sent_to": sent})
@@ -842,6 +929,8 @@ def update_order_status(order_doc_id):
 
     order_data = doc.to_dict()
     old_status = order_data.get("status", "")
+    customer_mobile = (order_data.get("mobile") or "").strip()
+    order_code = order_data.get("orderId") or order_doc_id
 
     if (new_status == "Cancelled"
             and old_status != "Cancelled"
@@ -852,10 +941,24 @@ def update_order_status(order_doc_id):
         # ✅ Save a copy to delivered_orders BEFORE deleting
         delivered_data = {**order_data, "status": "Delivered", "deliveredAt": datetime.now(UTC)}
         db.collection("delivered_orders").document(order_doc_id).set(delivered_data)
+        if customer_mobile:
+            send_customer_push(
+                customer_mobile,
+                title=f"Order {order_code} delivered",
+                body="Your order has been delivered. Thank you!",
+                data={"type": "order_status", "status": "Delivered", "orderId": str(order_code)},
+            )
         ref.delete()
         return jsonify({"status": "success", "message": "Order marked as delivered and removed."})
 
     ref.update({"status": new_status, "updatedAt": datetime.now(UTC)})
+    if customer_mobile:
+        send_customer_push(
+            customer_mobile,
+            title=f"Order {order_code} update",
+            body=f"Your order status is now {new_status}.",
+            data={"type": "order_status", "status": new_status, "orderId": str(order_code)},
+        )
     return jsonify({"status": "success", "message": f"Order status updated to '{new_status}'"})
 
 
