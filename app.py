@@ -24,6 +24,7 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 import base64
 import json
+import logging
 import math
 import os
 import uuid
@@ -34,12 +35,14 @@ from flask_cors import CORS
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, messaging
 from google.cloud.firestore import ArrayUnion
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 app = Flask(__name__)
 CORS(app)
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("freshmart")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,6 +63,9 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
+FCM_ANDROID_CHANNEL_ID = (os.environ.get("FCM_ANDROID_CHANNEL_ID") or "freshmart_orders").strip()
+FCM_ANDROID_CLICK_ACTION = (os.environ.get("FCM_ANDROID_CLICK_ACTION") or "FCM_PLUGIN_ACTIVITY").strip()
+WEBPUSH_CLICK_LINK = (os.environ.get("WEBPUSH_CLICK_LINK") or "").strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,6 +78,80 @@ def _order_dict(doc):
         if key in d and hasattr(d[key], "isoformat"):
             d[key] = d[key].isoformat()
     return d
+
+
+def _message_data(data: dict | None = None) -> dict:
+    return {str(k): str(v) for k, v in (data or {}).items()}
+
+
+def _is_https_url(url: str) -> bool:
+    return url.startswith("https://")
+
+
+def _build_fcm_message(token: str, title: str, body: str, data: dict | None = None):
+    android_notif = messaging.AndroidNotification(
+        sound="default",
+        click_action=FCM_ANDROID_CLICK_ACTION,
+    )
+    if FCM_ANDROID_CHANNEL_ID:
+        android_notif.channel_id = FCM_ANDROID_CHANNEL_ID
+
+    webpush_cfg = messaging.WebpushConfig(
+        headers={"Urgency": "high"},
+        notification=messaging.WebpushNotification(
+            title=title,
+            body=body,
+            icon="/logo192.png",
+            badge="/logo192.png",
+            tag="freshmart-order",
+            require_interaction=True,
+        ),
+    )
+    if _is_https_url(WEBPUSH_CLICK_LINK):
+        webpush_cfg.fcm_options = messaging.WebpushFCMOptions(link=WEBPUSH_CLICK_LINK)
+
+    return messaging.Message(
+        notification=messaging.Notification(title=title, body=body),
+        data=_message_data(data),
+        android=messaging.AndroidConfig(
+            priority="high",
+            ttl=120,
+            notification=android_notif,
+        ),
+        apns=messaging.APNSConfig(
+            payload=messaging.APNSPayload(
+                aps=messaging.Aps(sound="default", badge=1)
+            )
+        ),
+        webpush=webpush_cfg,
+        token=token,
+    )
+
+
+def send_push(title: str, body: str, data: dict = None):
+    """Send FCM push to ALL owner tokens stored in the owners collection."""
+    sent = 0
+    invalid_tokens = 0
+    for owner_doc in db.collection("owners").stream():
+        token = owner_doc.to_dict().get("fcmToken")
+        if not token:
+            continue
+        try:
+            msg = _build_fcm_message(token=token, title=title, body=body, data=data)
+            messaging.send(msg)
+            sent += 1
+        except Exception as e:
+            err = str(e).lower()
+            logger.warning("[FCM] send failed for token %s...: %s", token[:20], err)
+            if (
+                "registration-token-not-registered" in err
+                or "requested entity was not found" in err
+                or "unregistered" in err
+            ):
+                owner_doc.reference.update({"fcmToken": firestore.DELETE_FIELD})
+                invalid_tokens += 1
+    logger.info("[FCM] Sent to %s owner(s), removed %s invalid token(s): %s", sent, invalid_tokens, title)
+    return sent
 
 
 def normalise_unit(unit_value, unit_type):
@@ -273,6 +353,27 @@ def owner_login():
     safe = {k: v for k, v in owner_data.items()
             if k not in ("password", "createdAt", "updatedAt")}
     return jsonify({"status": "success", "owner": safe})
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# FCM TOKEN â€” save per owner
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+@app.route("/owner/save-fcm-token", methods=["POST"])
+def save_fcm_token():
+    data = request.json or {}
+    mobile = (data.get("mobile") or "").strip()
+    token = (data.get("fcmToken") or "").strip()
+
+    if not mobile or not token:
+        return jsonify({"status": "error", "message": "mobile and fcmToken required"}), 400
+
+    ref = db.collection("owners").document(mobile)
+    if not ref.get().exists:
+        return jsonify({"status": "error", "message": "Owner not found"}), 404
+
+    ref.update({"fcmToken": token, "tokenUpdatedAt": datetime.now(UTC)})
+    logger.info("[FCM] Token saved for owner %s: %s...", mobile, token[:20])
+    return jsonify({"status": "success", "message": "Token saved"})
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -839,6 +940,31 @@ def place_order():
                 else:
                     deduct = total_base if stock_unit == _normalise_unit_str(prod_data.get("unitType")) else qty
                 prod_ref.update({"quantity": max(0, cur_stock - deduct)})
+
+    # Fire push notification to owner(s)
+    try:
+        user_data = user_doc.to_dict() or {}
+        customer_name = (data.get("customerName") or user_data.get("name") or mobile).strip()
+        item_count = sum(int(i.get("qty", 1)) for i in items)
+        item_names = ", ".join((i.get("name") or "") for i in items[:3])
+        if len(items) > 3:
+            item_names += f" +{len(items)-3} more"
+
+        send_push(
+            title=f"New Order #{order_id}",
+            body=f"{customer_name} ordered {item_count} item(s): {item_names} - Rs.{items_total:.0f}",
+            data={
+                "orderId": order_id,
+                "docId": order_ref.id,
+                "mobile": mobile,
+                "totalPrice": str(items_total),
+                "type": "new_order",
+                "title": f"New Order #{order_id}",
+                "body": f"{customer_name} ordered {item_count} item(s)",
+            },
+        )
+    except Exception as exc:
+        logger.warning("[FCM] Failed to send new order notification: %s", exc)
 
     return jsonify({
         "status":  "success",
