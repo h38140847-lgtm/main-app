@@ -376,6 +376,20 @@ def save_fcm_token():
     return jsonify({"status": "success", "message": "Token saved"})
 
 
+@app.route("/owner/clear-fcm-token", methods=["POST"])
+def clear_fcm_token():
+    data = request.json or {}
+    mobile = (data.get("mobile") or "").strip()
+    if not mobile:
+        return jsonify({"status": "error", "message": "mobile required"}), 400
+    ref = db.collection("owners").document(mobile)
+    if not ref.get().exists:
+        return jsonify({"status": "error", "message": "Owner not found"}), 404
+    ref.update({"fcmToken": firestore.DELETE_FIELD, "tokenUpdatedAt": datetime.now(UTC)})
+    logger.info("[FCM] Token cleared for owner %s", mobile)
+    return jsonify({"status": "success", "message": "Token cleared"})
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # OWNER CONTACT
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1176,6 +1190,8 @@ def get_owner_profile(mobile):
         "shopName":  d.get("shopName", ""),
         "latitude":  d.get("latitude"),
         "longitude": d.get("longitude"),
+        "fcmToken":  d.get("fcmToken"),
+        "tokenUpdatedAt": d.get("tokenUpdatedAt").isoformat() if hasattr(d.get("tokenUpdatedAt"), "isoformat") else d.get("tokenUpdatedAt"),
     })
 @app.route("/customer/order/<order_doc_id>/hide", methods=["PUT"])
 def hide_order(order_doc_id):
