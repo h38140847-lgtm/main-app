@@ -1001,6 +1001,14 @@ def update_order_status(order_doc_id):
                 body="Your order has been delivered. Thank you!",
                 data={"type": "order_status", "status": "Delivered", "orderId": str(order_code)},
             )
+        try:
+            send_push(
+                title=f"Order {order_code} delivered",
+                body=f"Order {order_code} has been marked as delivered.",
+                data={"type": "order_status", "status": "Delivered", "orderId": str(order_code)},
+            )
+        except Exception as exc:
+            logger.warning("[FCM] Failed to notify owners about delivery %s: %s", order_code, exc)
         ref.delete()
         return jsonify({"status": "success", "message": "Order marked as delivered and removed."})
 
@@ -1595,6 +1603,9 @@ def get_profile(phone):
         "shopName":  data.get("shopName"),
         "shopImage": data.get("shopImage"),
         "location":  data.get("location"),
+        "fcmToken":  data.get("fcmToken"),
+        "fcmTokens": data.get("fcmTokens"),
+        "tokenUpdatedAt": data.get("tokenUpdatedAt").isoformat() if hasattr(data.get("tokenUpdatedAt"), "isoformat") else data.get("tokenUpdatedAt"),
     })
 
 
