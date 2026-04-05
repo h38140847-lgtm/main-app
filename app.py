@@ -259,6 +259,95 @@ def _normalise_unit_str(unit):
     return u
 
 
+def _to_base_stock(value, unit):
+    """Convert stock quantities to base units (g, ml, pcs) for comparison."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    u = _normalise_unit_str(unit)
+    if u == "kg":
+        return v * 1000
+    if u == "l":
+        return v * 1000
+    if u in ("g", "ml", "pcs"):
+        return v
+    return None
+
+
+def _stock_delta_for_pack_qty(prod_data: dict, pack_qty) -> float | None:
+    """Return stock delta in product stockUnit for a given pack quantity."""
+    try:
+        qty = float(pack_qty)
+    except (TypeError, ValueError):
+        return None
+
+    unit_value = float(prod_data.get("unitValue", 0))
+    stock_unit = _normalise_unit_str(prod_data.get("stockUnit"))
+    unit_type = _normalise_unit_str(prod_data.get("unitType"))
+    total_base = qty * unit_value
+
+    if stock_unit in ("kg", "l"):
+        return total_base / 1000
+    if stock_unit in ("g", "ml", "pcs"):
+        return total_base
+    if stock_unit == unit_type:
+        return total_base
+    return qty
+
+
+def _handle_low_stock_notification(prod_ref, prod_data: dict, new_stock: float):
+    """Notify owner when stock falls below threshold or hits zero."""
+    stock_unit = _normalise_unit_str(prod_data.get("stockUnit"))
+    if not stock_unit:
+        return
+
+    threshold_value = prod_data.get("thresholdValue")
+    threshold_unit = _normalise_unit_str(prod_data.get("thresholdUnit"))
+    if threshold_value in (None, "") or not threshold_unit:
+        threshold_value = 0
+        threshold_unit = stock_unit
+
+    try:
+        threshold_value = float(threshold_value)
+    except (TypeError, ValueError):
+        return
+
+    stock_base = _to_base_stock(new_stock, stock_unit)
+    threshold_base = _to_base_stock(threshold_value, threshold_unit)
+    if stock_base is None or threshold_base is None:
+        return
+
+    already_notified = bool(prod_data.get("lowStockNotified", False))
+    if stock_base <= threshold_base:
+        if already_notified:
+            return
+        name = (prod_data.get("name") or "Product").strip()
+        if new_stock <= 0:
+            title = "Out of stock"
+            body = f"{name} is out of stock."
+            data = {"type": "out_of_stock", "productId": prod_ref.id}
+        else:
+            title = "Low stock alert"
+            body = (
+                f"{name} stock is low: {new_stock:.2f} {stock_unit} left "
+                f"(threshold {threshold_value:.2f} {threshold_unit})."
+            )
+            data = {"type": "low_stock", "productId": prod_ref.id}
+        try:
+            send_push(title=title, body=body, data=data)
+        except Exception as exc:
+            logger.warning("[FCM] Failed to notify owners about low stock %s: %s", prod_ref.id, exc)
+        prod_ref.update({
+            "lowStockNotified": True,
+            "lowStockNotifiedAt": datetime.now(UTC),
+        })
+        return
+
+    if already_notified:
+        prod_ref.update({"lowStockNotified": False})
+
+
 def _verify_password(stored_value, plain_password):
     """Accept hashed passwords and legacy plaintext during migration."""
     if not stored_value:
@@ -338,23 +427,18 @@ def _restore_stock_for_order(order_data: dict):
         prod_ref = db.collection("products").document(pid)
         prod_doc = prod_ref.get()
         if prod_doc.exists:
-            prod_data  = prod_doc.to_dict()
-            unit_value = float(prod_data.get("unitValue", 0))
-            stock_unit = _normalise_unit_str(prod_data.get("stockUnit"))
-            cur_stock  = float(prod_data.get("quantity", 0))
-
-            total_base = qty * unit_value
-
-            if stock_unit == "kg":
-                restore = total_base / 1000
-            elif stock_unit == "l":
-                restore = total_base / 1000
-            elif stock_unit in ("g", "ml", "pcs"):
-                restore = total_base
-            else:
-                restore = total_base if stock_unit == _normalise_unit_str(prod_data.get("unitType")) else qty
-
-            prod_ref.update({"quantity": cur_stock + restore})
+            prod_data = prod_doc.to_dict()
+            cur_stock = float(prod_data.get("quantity", 0))
+            restore = _stock_delta_for_pack_qty(prod_data, qty)
+            if restore is None:
+                continue
+            new_stock = cur_stock + restore
+            prod_ref.update({"quantity": new_stock})
+            _handle_low_stock_notification(
+                prod_ref,
+                {**prod_data, "quantity": new_stock},
+                new_stock,
+            )
 
 # ═════════════════════════════════════════════════════════════════════════════
 # AUTH — CUSTOMER
@@ -757,8 +841,10 @@ def add_product():
 def update_product(product_id):
     data = request.json or {}
     ref  = db.collection("products").document(product_id)
-    if not ref.get().exists:
+    existing_doc = ref.get()
+    if not existing_doc.exists:
         return jsonify({"status": "error", "message": "Product not found"}), 404
+    existing_data = existing_doc.to_dict() or {}
 
     stock_unit = _normalise_unit_str(data.get("stockUnit"))
     if not stock_unit:
@@ -781,7 +867,7 @@ def update_product(product_id):
             float(data.get("unitValue")),
             (data.get("unitType") or "").strip()
         )
-        ref.update({
+        updated = {
             "name":        (data.get("name") or "").strip(),
             "description": (data.get("description") or "").strip(),
             "categoryId":  (data.get("categoryId") or "").strip(),
@@ -795,7 +881,11 @@ def update_product(product_id):
             "thresholdValue": threshold_value,
             "thresholdUnit":  threshold_unit,
             "updatedAt":   datetime.now(UTC),
-        })
+        }
+        ref.update(updated)
+        new_stock = float(updated.get("quantity", 0))
+        merged = {**existing_data, **updated, "quantity": new_stock}
+        _handle_low_stock_notification(ref, merged, new_stock)
     except (TypeError, ValueError):
         return jsonify({"status": "error", "message": "price, quantity, unitValue must be numbers"}), 400
 
@@ -825,7 +915,8 @@ def toggle_product(product_id):
 def restock_product(product_id):
     data = request.json or {}
     ref  = db.collection("products").document(product_id)
-    if not ref.get().exists:
+    doc = ref.get()
+    if not doc.exists:
         return jsonify({"status": "error", "message": "Product not found"}), 404
     try:
         qty = float(data.get("quantity"))
@@ -838,6 +929,9 @@ def restock_product(product_id):
         update_data["stockUnit"] = _normalise_unit_str(data.get("stockUnit"))
 
     ref.update(update_data)
+    prod_data = doc.to_dict() or {}
+    merged = {**prod_data, **update_data}
+    _handle_low_stock_notification(ref, merged, qty)
     return jsonify({"status": "success", "message": f"Stock updated to {qty}"})
 
 
@@ -1200,20 +1294,18 @@ def place_order():
             prod_ref = db.collection("products").document(pid)
             prod_doc = prod_ref.get()
             if prod_doc.exists:
-                prod_data  = prod_doc.to_dict()
-                unit_value = float(prod_data.get("unitValue", 0))
-                stock_unit = _normalise_unit_str(prod_data.get("stockUnit"))
-                cur_stock  = float(prod_data.get("quantity", 0))
-                total_base = qty * unit_value
-                if stock_unit == "kg":
-                    deduct = total_base / 1000
-                elif stock_unit == "l":
-                    deduct = total_base / 1000
-                elif stock_unit in ("g", "ml", "pcs"):
-                    deduct = total_base
-                else:
-                    deduct = total_base if stock_unit == _normalise_unit_str(prod_data.get("unitType")) else qty
-                prod_ref.update({"quantity": max(0, cur_stock - deduct)})
+                prod_data = prod_doc.to_dict()
+                cur_stock = float(prod_data.get("quantity", 0))
+                deduct = _stock_delta_for_pack_qty(prod_data, qty)
+                if deduct is None:
+                    continue
+                new_stock = max(0, cur_stock - deduct)
+                prod_ref.update({"quantity": new_stock})
+                _handle_low_stock_notification(
+                    prod_ref,
+                    {**prod_data, "quantity": new_stock},
+                    new_stock,
+                )
 
     # Fire push notification to owner(s)
     try:
@@ -1384,17 +1476,31 @@ def edit_order_items(order_doc_id):
         if diff > 0:
             ref = db.collection("products").document(pid)
             d   = ref.get()
-            if d.exists: ref.update({"quantity": d.to_dict().get("quantity", 0) + diff})
+            if d.exists:
+                prod_data = d.to_dict() or {}
+                cur = float(prod_data.get("quantity", 0))
+                delta = _stock_delta_for_pack_qty(prod_data, diff)
+                if delta is None:
+                    continue
+                new_stock = cur + delta
+                ref.update({"quantity": new_stock})
+                _handle_low_stock_notification(ref, {**prod_data, "quantity": new_stock}, new_stock)
     for pid, nq in new_qty.items():
         diff = nq - old_qty.get(pid, 0)
         if diff > 0:
             ref = db.collection("products").document(pid)
             d   = ref.get()
             if d.exists:
-                cur = d.to_dict().get("quantity", 0)
-                if cur < diff:
+                prod_data = d.to_dict() or {}
+                cur = float(prod_data.get("quantity", 0))
+                delta = _stock_delta_for_pack_qty(prod_data, diff)
+                if delta is None:
+                    continue
+                if cur < delta:
                     return jsonify({"status": "error", "message": f"Not enough stock for '{pid}'"}), 400
-                ref.update({"quantity": cur - diff})
+                new_stock = max(0, cur - delta)
+                ref.update({"quantity": new_stock})
+                _handle_low_stock_notification(ref, {**prod_data, "quantity": new_stock}, new_stock)
     order_ref.update({"items": new_items, "totalPrice": float(new_total), "updatedAt": datetime.now(UTC)})
     return jsonify({"status": "success", "message": "Order items updated"})
 
