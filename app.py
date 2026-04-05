@@ -382,6 +382,14 @@ def customer_register():
         "approved":  False,
         "createdAt": datetime.now(UTC),
     })
+    try:
+        send_push(
+            title="New customer зарегистр",
+            body=f"New customer registered: {name} ({mobile})",
+            data={"type": "new_customer", "mobile": mobile, "name": name},
+        )
+    except Exception as exc:
+        logger.warning("[FCM] Failed to notify owners about new customer %s: %s", mobile, exc)
     return jsonify({
         "status":  "success",
         "message": "Registered successfully",
@@ -696,6 +704,8 @@ def add_product():
     unit_type   = data.get("unitType")     # unit per pack (e.g. "g")
     quantity    = data.get("quantity")     # stock amount  (e.g. 25)
     stock_unit  = _normalise_unit_str(data.get("stockUnit"))   # stock unit (e.g. "kg") ← NEW
+    threshold_value = data.get("thresholdValue")
+    threshold_unit  = _normalise_unit_str(data.get("thresholdUnit"))
     presets = data.get("presets") or []  
     # Validate required fields
     if not name:
@@ -710,9 +720,19 @@ def add_product():
         return jsonify({"status": "error", "message": "quantity is required"}), 400
     if not stock_unit:
         return jsonify({"status": "error", "message": "stockUnit is required"}), 400
+    if threshold_value not in (None, "") and not threshold_unit:
+        return jsonify({"status": "error", "message": "thresholdUnit is required when thresholdValue is set"}), 400
 
     # Normalise pack unit (kg→g, l→ml) for consistent storage
     canon_value, canon_type = normalise_unit(unit_value, unit_type)
+    if threshold_value in (None, ""):
+        threshold_value = None
+        threshold_unit = None
+    else:
+        try:
+            threshold_value = float(threshold_value)
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "thresholdValue must be a number"}), 400
 
     db.collection("products").add({
         "name":        name,
@@ -725,6 +745,8 @@ def add_product():
         "quantity":    float(quantity),  
         "presets": presets,    # stock amount
         "stockUnit":   stock_unit,           # stock unit ← NEW
+        "thresholdValue": threshold_value,
+        "thresholdUnit":  threshold_unit,
         "isActive":    True,
         "createdAt":   datetime.now(UTC),
     })
@@ -741,6 +763,18 @@ def update_product(product_id):
     stock_unit = _normalise_unit_str(data.get("stockUnit"))
     if not stock_unit:
         return jsonify({"status": "error", "message": "stockUnit is required"}), 400
+    threshold_value = data.get("thresholdValue")
+    threshold_unit  = _normalise_unit_str(data.get("thresholdUnit"))
+    if threshold_value not in (None, "") and not threshold_unit:
+        return jsonify({"status": "error", "message": "thresholdUnit is required when thresholdValue is set"}), 400
+    if threshold_value in (None, ""):
+        threshold_value = None
+        threshold_unit = None
+    else:
+        try:
+            threshold_value = float(threshold_value)
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "thresholdValue must be a number"}), 400
 
     try:
         canon_value, canon_type = normalise_unit(
@@ -758,6 +792,8 @@ def update_product(product_id):
             "quantity":    float(data.get("quantity")),
             "stockUnit":   stock_unit,  
             "presets": data.get("presets") or [],            # ← NEW
+            "thresholdValue": threshold_value,
+            "thresholdUnit":  threshold_unit,
             "updatedAt":   datetime.now(UTC),
         })
     except (TypeError, ValueError):
@@ -1687,6 +1723,14 @@ def delivery_register():
         "isActive":  True,
         "createdAt": datetime.now(UTC),
     })
+    try:
+        send_push(
+            title="New delivery partner registered",
+            body=f"Delivery partner: {name} ({mobile})",
+            data={"type": "new_delivery", "mobile": mobile, "name": name},
+        )
+    except Exception as exc:
+        logger.warning("[FCM] Failed to notify owners about new delivery %s: %s", mobile, exc)
     return jsonify({
         "status": "success",
         "message": "Registered successfully",
