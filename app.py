@@ -1327,6 +1327,8 @@ def place_order():
                 "type": "new_order",
                 "title": f"New Order #{order_id}",
                 "body": f"{customer_name} ordered {item_count} item(s)",
+                "page": "orders",
+                "deepLink": "/?page=orders",
             },
         )
     except Exception as exc:
