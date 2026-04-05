@@ -181,9 +181,12 @@ def send_delivery_push(mobile: str, title: str, body: str, data: dict = None) ->
     if not tokens:
         return 0
     sent = 0
+    payload = data or {}
+    payload.setdefault("page", "orders")
+    payload.setdefault("deepLink", "/?page=orders")
     for token in tokens:
         try:
-            msg = _build_fcm_message(token=token, title=title, body=body, data=data)
+            msg = _build_fcm_message(token=token, title=title, body=body, data=payload)
             messaging.send(msg)
             sent += 1
         except Exception as e:
@@ -210,9 +213,12 @@ def send_customer_push(mobile: str, title: str, body: str, data: dict = None) ->
     tokens = _collect_tokens(user_doc.to_dict())
     if not tokens:
         return 0
+    payload = data or {}
+    payload.setdefault("page", "orders")
+    payload.setdefault("deepLink", "/?page=orders")
     for token in tokens:
         try:
-            msg = _build_fcm_message(token=token, title=title, body=body, data=data)
+            msg = _build_fcm_message(token=token, title=title, body=body, data=payload)
             messaging.send(msg)
             sent += 1
         except Exception as e:
@@ -326,14 +332,24 @@ def _handle_low_stock_notification(prod_ref, prod_data: dict, new_stock: float):
         if new_stock <= 0:
             title = "Out of stock"
             body = f"{name} is out of stock."
-            data = {"type": "out_of_stock", "productId": prod_ref.id}
+            data = {
+                "type": "out_of_stock",
+                "productId": prod_ref.id,
+                "page": "products",
+                "deepLink": "/?page=products",
+            }
         else:
             title = "Low stock alert"
             body = (
                 f"{name} stock is low: {new_stock:.2f} {stock_unit} left "
                 f"(threshold {threshold_value:.2f} {threshold_unit})."
             )
-            data = {"type": "low_stock", "productId": prod_ref.id}
+            data = {
+                "type": "low_stock",
+                "productId": prod_ref.id,
+                "page": "products",
+                "deepLink": "/?page=products",
+            }
         try:
             send_push(title=title, body=body, data=data)
         except Exception as exc:
@@ -470,7 +486,13 @@ def customer_register():
         send_push(
             title="New customer зарегистр",
             body=f"New customer registered: {name} ({mobile})",
-            data={"type": "new_customer", "mobile": mobile, "name": name},
+            data={
+                "type": "new_customer",
+                "mobile": mobile,
+                "name": name,
+                "page": "users",
+                "deepLink": "/?page=users",
+            },
         )
     except Exception as exc:
         logger.warning("[FCM] Failed to notify owners about new customer %s: %s", mobile, exc)
@@ -1129,13 +1151,25 @@ def update_order_status(order_doc_id):
                 customer_mobile,
                 title=f"Order {order_code} delivered",
                 body="Your order has been delivered. Thank you!",
-                data={"type": "order_status", "status": "Delivered", "orderId": str(order_code)},
+                data={
+                    "type": "order_status",
+                    "status": "Delivered",
+                    "orderId": str(order_code),
+                    "page": "orders",
+                    "deepLink": "/?page=orders",
+                },
             )
         try:
             send_push(
                 title=f"Order {order_code} delivered",
                 body=f"Order {order_code} has been marked as delivered.",
-                data={"type": "order_status", "status": "Delivered", "orderId": str(order_code)},
+                data={
+                    "type": "order_status",
+                    "status": "Delivered",
+                    "orderId": str(order_code),
+                    "page": "orders",
+                    "deepLink": "/?page=orders",
+                },
             )
         except Exception as exc:
             logger.warning("[FCM] Failed to notify owners about delivery %s: %s", order_code, exc)
@@ -1148,7 +1182,13 @@ def update_order_status(order_doc_id):
             customer_mobile,
             title=f"Order {order_code} update",
             body=f"Your order status is now {new_status}.",
-            data={"type": "order_status", "status": new_status, "orderId": str(order_code)},
+            data={
+                "type": "order_status",
+                "status": new_status,
+                "orderId": str(order_code),
+                "page": "orders",
+                "deepLink": "/?page=orders",
+            },
         )
     return jsonify({"status": "success", "message": f"Order status updated to '{new_status}'"})
 
@@ -1333,6 +1373,22 @@ def place_order():
         )
     except Exception as exc:
         logger.warning("[FCM] Failed to send new order notification: %s", exc)
+
+    # Fire push notification to customer (order placed)
+    try:
+        send_customer_push(
+            mobile,
+            title=f"Order #{order_id} placed",
+            body="Your order has been placed successfully.",
+            data={
+                "type": "order_placed",
+                "orderId": order_id,
+                "page": "orders",
+                "deepLink": "/?page=orders",
+            },
+        )
+    except Exception as exc:
+        logger.warning("[FCM] Failed to notify customer about order %s: %s", order_id, exc)
 
     return jsonify({
         "status":  "success",
@@ -1835,7 +1891,13 @@ def delivery_register():
         send_push(
             title="New delivery partner registered",
             body=f"Delivery partner: {name} ({mobile})",
-            data={"type": "new_delivery", "mobile": mobile, "name": name},
+            data={
+                "type": "new_delivery",
+                "mobile": mobile,
+                "name": name,
+                "page": "orders",
+                "deepLink": "/?page=orders",
+            },
         )
     except Exception as exc:
         logger.warning("[FCM] Failed to notify owners about new delivery %s: %s", mobile, exc)
